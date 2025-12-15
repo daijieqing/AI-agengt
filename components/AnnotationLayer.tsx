@@ -104,13 +104,15 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
       const response = await fetch(`${API_BASE_URL}?${params.toString()}`);
       
       if (!response.ok) {
-         // Try to parse JSON error first, else text
+         // Fix: Read text once to avoid "body stream already read"
+         const errorText = await response.text();
          let errMsg = `API Error ${response.status}`;
          try {
-            const errJson = await response.json();
+            const errJson = JSON.parse(errorText);
             if (errJson.error) errMsg = errJson.error;
+            else errMsg += `: ${errorText.substring(0, 50)}...`;
          } catch(e) {
-            errMsg += `: ${await response.text()}`;
+            errMsg += `: ${errorText.substring(0, 50)}...`;
          }
          throw new Error(errMsg);
       }
@@ -189,12 +191,14 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
                })
             });
             if (!res.ok) {
+                // Fix: Read text once
+                const errorText = await res.text();
                 let errMsg = `Save Failed ${res.status}`;
                 try {
-                    const errJson = await res.json();
+                    const errJson = JSON.parse(errorText);
                     if (errJson.error) errMsg = errJson.error;
                 } catch(e) {
-                    errMsg = await res.text();
+                    errMsg += `: ${errorText.substring(0, 50)}...`;
                 }
                 throw new Error(errMsg);
             }

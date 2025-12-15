@@ -14,10 +14,18 @@ import {
   MapPin,
   RotateCcw,
   Code,
-  Copy
+  Copy,
+  Database,
+  Wifi,
+  WifiOff,
+  Loader2
 } from 'lucide-react';
 import { Annotation } from '../types';
 import { MOCK_ANNOTATIONS } from '../mockData';
+
+// From metadata.json
+const PROJECT_NAME = "需求合规行检查定稿+智能体中心";
+const API_BASE_URL = '/api/d1/markers'; // Hypothetical Cloudflare Worker Endpoint
 
 interface AnnotationLayerProps {
   viewId: string;
@@ -25,31 +33,13 @@ interface AnnotationLayerProps {
 }
 
 const STORAGE_KEY = 'system_center_annotations_v2';
+type StorageStatus = 'LOCAL' | 'D1_CONNECTING' | 'D1_CONNECTED' | 'D1_ERROR';
 
 export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageName }) => {
   // --- STATE ---
-  // Initialize store with robust merging strategy
-  const [store, setStore] = useState<Record<string, Annotation[]>>(() => {
-    let initialData = { ...MOCK_ANNOTATIONS };
-    
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsedData = JSON.parse(saved);
-        // Merge saved data with mock data structure to ensure missing keys (new views) are handled
-        // LocalStorage takes precedence for existing keys
-        initialData = {
-          ...MOCK_ANNOTATIONS,
-          ...parsedData
-        };
-      }
-    } catch (e) {
-      console.error("Failed to load annotations from local storage", e);
-    }
-    
-    return initialData;
-  });
-
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [status, setStatus] = useState<StorageStatus>('D1_CONNECTING');
+  
   const [isEditMode, setIsEditMode] = useState(false);
   const [isVisible, setIsVisible] = useState(true);
   
@@ -70,33 +60,201 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
   const [showExportModal, setShowExportModal] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  // Get current view's annotations (safe access)
-  const annotations = store[viewId] || [];
+  // --- D1 / STORAGE LOGIC ---
 
-  // --- PERSISTENCE ---
-  // Save to localStorage whenever store changes
-  useEffect(() => {
+  // Helper: Get data from local storage as fallback
+  const getLocalData = (): Annotation[] => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return parsed[viewId] || MOCK_ANNOTATIONS[viewId] || [];
+      }
+      return MOCK_ANNOTATIONS[viewId] || [];
     } catch (e) {
-      console.error("Failed to save annotations to local storage", e);
+      return [];
     }
-  }, [store]);
-
-  // Helper to update current view's annotations
-  const setAnnotations = (newAnnotations: Annotation[]) => {
-    setStore(prev => ({
-      ...prev,
-      [viewId]: newAnnotations
-    }));
   };
 
-  // Reset to default mock data
-  const handleReset = () => {
-    if (confirm('确定要重置所有标注为默认状态吗？您的自定义标注将丢失。')) {
-      setStore({ ...MOCK_ANNOTATIONS });
-      localStorage.removeItem(STORAGE_KEY);
+  // Helper: Save data to local storage as fallback
+  const saveLocalData = (newNotes: Annotation[]) => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      const parsed = saved ? JSON.parse(saved) : { ...MOCK_ANNOTATIONS };
+      parsed[viewId] = newNotes;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+    } catch (e) {
+      console.error("Local Save Error", e);
     }
+  };
+
+  // 1. Fetch Logic
+  useEffect(() => {
+    let isMounted = true;
+    
+    const fetchMarkers = async () => {
+      setStatus('D1_CONNECTING');
+      try {
+        // Construct query params for isolation
+        const params = new URLSearchParams({
+          project_name: PROJECT_NAME,
+          page_context: viewId
+        });
+        
+        const response = await fetch(`${API_BASE_URL}?${params.toString()}`);
+        
+        if (!response.ok) {
+           throw new Error('D1 API Error');
+        }
+
+        const data = await response.json();
+        if (isMounted) {
+          // Convert D1 records to frontend Annotation objects
+          // Assuming D1 returns { id, x, y, content, ... }
+          const loadedAnnotations: Annotation[] = data.map((row: any) => ({
+             id: String(row.id), // Ensure string for frontend logic
+             x: row.x,
+             y: row.y,
+             content: row.content,
+             author: row.author,
+             created_at: row.created_at,
+             is_resolved: row.is_resolved,
+             project_name: row.project_name,
+             page_context: row.page_context,
+             isOpen: false // Default closed on load
+          }));
+          setAnnotations(loadedAnnotations);
+          setStatus('D1_CONNECTED');
+        }
+      } catch (error) {
+        console.warn("D1 Fetch Failed, falling back to LocalStorage:", error);
+        if (isMounted) {
+          setAnnotations(getLocalData());
+          setStatus('D1_ERROR');
+        }
+      }
+    };
+
+    fetchMarkers();
+
+    return () => { isMounted = false; };
+  }, [viewId]);
+
+  // 2. Create Logic
+  const handleSaveNewAnnotation = async () => {
+    if (pendingText.trim() && pendingPoint) {
+      const tempId = Date.now().toString();
+      const newNote: Annotation = {
+        id: tempId,
+        x: pendingPoint.x,
+        y: pendingPoint.y,
+        content: pendingText,
+        isOpen: true,
+        author: '张小六', // Mock User
+        created_at: new Date().toISOString(),
+        is_resolved: 0,
+        project_name: PROJECT_NAME,
+        page_context: viewId
+      };
+
+      // Optimistic UI Update
+      setAnnotations(prev => [...prev, newNote]);
+      setPendingPoint(null);
+      setPendingText('');
+
+      if (status === 'D1_CONNECTED' || status === 'D1_CONNECTING') {
+         try {
+            const res = await fetch(API_BASE_URL, {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify({
+                  x: newNote.x,
+                  y: newNote.y,
+                  content: newNote.content,
+                  author: newNote.author,
+                  created_at: newNote.created_at,
+                  is_resolved: newNote.is_resolved,
+                  project_name: newNote.project_name,
+                  page_context: newNote.page_context
+               })
+            });
+            if (!res.ok) throw new Error('Failed to save to D1');
+            
+            // If D1 returns the new ID, update the optimistic note
+            const savedData = await res.json();
+            if (savedData && savedData.id) {
+               setAnnotations(prev => prev.map(a => a.id === tempId ? { ...a, id: String(savedData.id) } : a));
+            }
+         } catch (e) {
+            console.error("Save to D1 failed", e);
+            setStatus('D1_ERROR');
+            // Fallback save locally
+            saveLocalData([...annotations, newNote]);
+         }
+      } else {
+         saveLocalData([...annotations, newNote]);
+      }
+    }
+  };
+
+  // 3. Delete Logic
+  const handleDeleteAnnotation = async (id: string) => {
+    // Optimistic Delete
+    const prevAnnotations = [...annotations];
+    const newAnnotations = annotations.filter(a => a.id !== id);
+    setAnnotations(newAnnotations);
+
+    if (status === 'D1_CONNECTED') {
+       try {
+          // Check if it's a temp ID (timestamp) or D1 ID (usually smaller integer number)
+          // If it's a huge number (timestamp), it might not exist in D1 yet if the save failed? 
+          // But for simplicity assume we try to delete.
+          await fetch(`${API_BASE_URL}/${id}`, { method: 'DELETE' });
+       } catch (e) {
+          console.error("Delete from D1 failed", e);
+          setStatus('D1_ERROR');
+          setAnnotations(prevAnnotations); // Revert
+          saveLocalData(newAnnotations); // Fallback
+       }
+    } else {
+       saveLocalData(newAnnotations);
+    }
+  };
+
+  // 4. Update Logic
+  const handleSaveEdit = async (id: string) => {
+    const prevAnnotations = [...annotations];
+    const newAnnotations = annotations.map(a => 
+      a.id === id ? { ...a, content: editText } : a
+    );
+    setAnnotations(newAnnotations);
+    setEditingId(null);
+
+    if (status === 'D1_CONNECTED') {
+      try {
+         const target = newAnnotations.find(a => a.id === id);
+         await fetch(`${API_BASE_URL}/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: editText, is_resolved: target?.is_resolved })
+         });
+      } catch (e) {
+         console.error("Update D1 failed", e);
+         setStatus('D1_ERROR');
+         saveLocalData(newAnnotations);
+      }
+    } else {
+      saveLocalData(newAnnotations);
+    }
+  };
+
+  const handleReset = () => {
+     if (confirm('确定要重置当前页面的标注吗？')) {
+        setAnnotations([]);
+        if (status !== 'D1_CONNECTED') {
+           localStorage.removeItem(STORAGE_KEY);
+        }
+     }
   };
 
   // --- EXPORT LOGIC ---
@@ -106,8 +264,10 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
   };
 
   const getExportCode = () => {
-    return `// 将此代码复制到 src/mockData.ts 文件中，替换原有的 MOCK_ANNOTATIONS 定义
-export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(store, null, 2)};`;
+    return `// D1 Database Migration Export
+// Project: ${PROJECT_NAME}
+// Page: ${viewId}
+export const ANNOTATIONS = ${JSON.stringify(annotations, null, 2)};`;
   };
 
   const copyToClipboard = () => {
@@ -150,54 +310,21 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
     };
   }, [isDragging]);
 
-  // --- ANNOTATION CREATION LOGIC ---
+  // --- INTERACTION LOGIC ---
   const handleCanvasClick = (e: React.MouseEvent) => {
     if (!isEditMode || pendingPoint || editingId) return;
-
-    // Calculate percentage coordinates to be responsive
     const x = (e.clientX / window.innerWidth) * 100;
     const y = (e.clientY / window.innerHeight) * 100;
-
     setPendingPoint({ x, y });
     setPendingText('');
   };
 
-  const saveNewAnnotation = () => {
-    if (pendingText.trim() && pendingPoint) {
-      const newNote: Annotation = {
-        id: Date.now().toString(),
-        x: pendingPoint.x,
-        y: pendingPoint.y,
-        content: pendingText,
-        isOpen: true
-      };
-      // Use functional update to ensure we have the latest state of annotations for this view
-      setStore(prev => {
-        const currentViewNotes = prev[viewId] || [];
-        return {
-          ...prev,
-          [viewId]: [...currentViewNotes, newNote]
-        };
-      });
-    }
-    setPendingPoint(null);
-    setPendingText('');
-    // Optional: Keep edit mode on for multiple additions
-  };
-
-  // --- ANNOTATION MANAGEMENT ---
   const toggleMarkerOpen = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const newAnnotations = annotations.map(a => 
+    setAnnotations(prev => prev.map(a => 
       a.id === id ? { ...a, isOpen: !a.isOpen } : { ...a, isOpen: false }
-    );
-    setAnnotations(newAnnotations);
+    ));
     setEditingId(null);
-  };
-
-  const deleteAnnotation = (id: string) => {
-    const newAnnotations = annotations.filter(a => a.id !== id);
-    setAnnotations(newAnnotations);
   };
 
   const startEditing = (note: Annotation) => {
@@ -205,23 +332,27 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
     setEditText(note.content);
   };
 
-  const saveEdit = (id: string) => {
-    const newAnnotations = annotations.map(a => 
-      a.id === id ? { ...a, content: editText } : a
-    );
-    setAnnotations(newAnnotations);
-    setEditingId(null);
+  // Helper to render Status Icon
+  const renderStatusIcon = () => {
+     switch(status) {
+        case 'D1_CONNECTED': 
+           return <div title="已连接 Cloudflare D1 数据库" className="flex items-center gap-1 text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded text-xs font-bold border border-emerald-100"><Database size={12}/><Wifi size={12}/> D1</div>;
+        case 'D1_CONNECTING': 
+           return <div title="正在连接数据库..." className="flex items-center gap-1 text-blue-600 bg-blue-50 px-2 py-0.5 rounded text-xs font-bold border border-blue-100"><Loader2 size={12} className="animate-spin"/> 连接中</div>;
+        case 'D1_ERROR': 
+        case 'LOCAL':
+           return <div title="D1 连接失败，使用本地存储" className="flex items-center gap-1 text-orange-600 bg-orange-50 px-2 py-0.5 rounded text-xs font-bold border border-orange-100"><WifiOff size={12}/> Local</div>;
+     }
   };
 
   return (
     <>
-      {/* 1. EDIT MODE OVERLAY (Captures Clicks) */}
+      {/* 1. EDIT MODE OVERLAY */}
       {isEditMode && (
         <div 
           onClick={handleCanvasClick}
           className={`fixed inset-0 z-[9000] cursor-crosshair transition-colors duration-200 ${pendingPoint ? 'bg-black/10' : 'bg-transparent'}`}
         >
-          {/* Guide Text */}
           {!pendingPoint && (
              <div 
                className="fixed pointer-events-none px-3 py-1.5 bg-slate-800/80 text-white text-xs rounded-full backdrop-blur-sm shadow-lg transform -translate-x-1/2 -translate-y-1/2 mt-[-20px] animate-in fade-in slide-in-from-bottom-2"
@@ -233,12 +364,11 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
         </div>
       )}
 
-      {/* 2. DRAGGABLE TOOLBAR - NEW DESIGN */}
+      {/* 2. DRAGGABLE TOOLBAR */}
       <div 
         style={{ left: position.x, top: position.y }}
         className="fixed z-[9999] bg-white rounded-full shadow-[0_8px_30px_rgb(0,0,0,0.12)] border border-gray-100 flex items-center h-12 select-none animate-in fade-in zoom-in duration-300 min-w-[500px]"
       >
-        {/* Drag Handle */}
         <div 
           onMouseDown={handleMouseDown}
           className="cursor-move h-full px-3 flex items-center justify-center text-slate-300 hover:text-slate-500 transition-colors rounded-l-full"
@@ -246,10 +376,8 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
           <GripVertical size={16} />
         </div>
 
-        {/* Divider */}
         <div className="w-px h-6 bg-gray-200"></div>
 
-        {/* Visibility Toggle */}
         <button
           onClick={() => setIsVisible(!isVisible)}
           className={`flex items-center gap-2 px-4 h-full text-sm transition-colors hover:bg-gray-50
@@ -260,10 +388,8 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
           <span>{isVisible ? '已显示' : '已隐藏'}</span>
         </button>
 
-        {/* Divider */}
         <div className="w-px h-6 bg-gray-200"></div>
 
-        {/* Edit Mode Toggle */}
         <button
           onClick={() => {
             setIsEditMode(!isEditMode);
@@ -279,42 +405,36 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
           <span>{isEditMode ? '标注中' : '开启标注'}</span>
         </button>
 
-         {/* Divider */}
          <div className="w-px h-6 bg-gray-200"></div>
 
-         {/* Reset Button */}
          <button
             onClick={handleReset}
             className="flex items-center justify-center px-3 h-full text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors"
-            title="重置为默认数据"
+            title="清空当前页面标注"
          >
             <RotateCcw size={14} />
          </button>
          
-         {/* Divider */}
          <div className="w-px h-6 bg-gray-200"></div>
 
-         {/* Export Button */}
          <button
             onClick={handleExport}
             className="flex items-center justify-center px-3 h-full text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-colors"
-            title="保存到代码 (Export)"
+            title="导出数据"
          >
             <Code size={16} />
          </button>
 
-        {/* Divider */}
         <div className="w-px h-6 bg-gray-200"></div>
 
-        {/* Page Context Info */}
-        <div className="flex items-center gap-2 px-5 h-full text-sm text-slate-500 whitespace-nowrap flex-1 justify-end pr-6">
-          <MapPin size={14} />
-          <span className="max-w-[120px] truncate">{pageName}</span>
-          {annotations.length > 0 && (
-             <span className="bg-gray-100 text-slate-600 text-xs px-1.5 py-0.5 rounded-md font-medium min-w-[20px] text-center">
-               {annotations.length}
-             </span>
-          )}
+        <div className="flex items-center gap-3 px-5 h-full text-sm text-slate-500 whitespace-nowrap flex-1 justify-end pr-6">
+          {/* Storage Status Indicator */}
+          {renderStatusIcon()}
+          
+          <div className="flex items-center gap-1.5 pl-2 border-l border-gray-100">
+             <MapPin size={14} />
+             <span className="max-w-[100px] truncate">{pageName}</span>
+          </div>
         </div>
       </div>
 
@@ -324,7 +444,7 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl flex flex-col max-h-[85vh] animate-in zoom-in-95 duration-200">
             <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
               <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                 <Code size={20} className="text-blue-600"/> 导出标注配置 (Save to Code)
+                 <Code size={20} className="text-blue-600"/> 导出标注数据
               </h3>
               <button onClick={() => setShowExportModal(false)} className="p-1 hover:bg-gray-100 rounded-full transition-colors">
                  <X size={20} className="text-slate-400" />
@@ -334,8 +454,8 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                <div className="bg-blue-50 text-blue-800 text-sm p-4 rounded-lg border border-blue-100 flex items-start gap-3">
                   <div className="mt-0.5"><MessageSquarePlus size={16} /></div>
                   <div>
-                    <div className="font-bold mb-1">如何永久保存我的标注？</div>
-                    由于浏览器安全限制，网页无法直接修改源码文件。请点击下方“复制配置代码”按钮，然后将代码粘贴到项目中的 <b>src/mockData.ts</b> 文件，替换原有的 <b>MOCK_ANNOTATIONS</b> 定义。
+                    <div className="font-bold mb-1">D1 数据库同步</div>
+                    当前正在使用 <b>{status === 'D1_CONNECTED' ? 'Cloudflare D1' : '本地存储 (Local Fallback)'}</b>。项目名称: {PROJECT_NAME}, 页面上下文: {viewId}。
                   </div>
                </div>
                <div className="relative flex-1 border border-gray-200 rounded-lg overflow-hidden bg-[#1e1e1e] shadow-inner">
@@ -345,7 +465,7 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                      value={getExportCode()}
                      spellCheck={false}
                   />
-                  <div className="absolute top-2 right-2 text-[10px] text-gray-500 font-mono">TypeScript</div>
+                  <div className="absolute top-2 right-2 text-[10px] text-gray-500 font-mono">JSON</div>
                </div>
             </div>
             <div className="px-6 py-4 border-t border-gray-100 bg-gray-50 rounded-b-xl flex justify-end gap-3">
@@ -357,7 +477,7 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                  `}
                >
                   {copied ? <Check size={16} /> : <Copy size={16} />}
-                  {copied ? '已复制到剪贴板' : '复制配置代码'}
+                  {copied ? '已复制' : '复制数据'}
                </button>
             </div>
           </div>
@@ -367,14 +487,12 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
       {/* 4. MARKERS & POPOVERS */}
       {isVisible && (
         <div className="fixed inset-0 z-[9001] pointer-events-none overflow-hidden">
-          {/* A. EXISTING MARKERS */}
           {annotations.map(note => (
             <div 
               key={note.id}
               style={{ left: `${note.x}%`, top: `${note.y}%` }}
               className="absolute transform -translate-x-1/2 -translate-y-1/2"
             >
-              {/* The Dot Icon */}
               <div className="relative group pointer-events-auto">
                  <button 
                     onClick={(e) => toggleMarkerOpen(note.id, e)}
@@ -387,18 +505,14 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                  >
                     <MessageCircle size={16} fill="currentColor" />
                  </button>
-                 
-                 {/* Ripple Effect */}
                  {!note.isOpen && (
                    <div className="absolute inset-0 rounded-full bg-violet-400 animate-ping opacity-75 -z-10 duration-1000"></div>
                  )}
               </div>
 
-              {/* Detail Popover */}
               {note.isOpen && (
                 <div className="absolute top-full left-1/2 -translate-x-1/2 mt-3 w-72 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden pointer-events-auto animate-in slide-in-from-top-2 fade-in z-30">
                    {editingId === note.id ? (
-                      // Edit Mode inside Popover
                       <div className="p-3">
                          <textarea 
                             value={editText}
@@ -408,37 +522,37 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                          />
                          <div className="flex gap-2 justify-end">
                             <button onClick={() => setEditingId(null)} className="px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-100 rounded-md transition-colors">取消</button>
-                            <button onClick={() => saveEdit(note.id)} className="px-3 py-1.5 text-xs bg-violet-600 text-white rounded-md hover:bg-violet-700 transition-colors shadow-sm">保存更新</button>
+                            <button onClick={() => handleSaveEdit(note.id)} className="px-3 py-1.5 text-xs bg-violet-600 text-white rounded-md hover:bg-violet-700 transition-colors shadow-sm">保存更新</button>
                          </div>
                       </div>
                    ) : (
-                      // View Mode inside Popover
                       <>
                         <div className="p-4 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto">
                            {note.content}
                         </div>
                         <div className="bg-gray-50/80 px-4 py-2 flex justify-between items-center border-t border-gray-100">
-                           <span className="text-[10px] text-gray-400 font-medium">刚刚</span>
+                           <div className="flex flex-col">
+                              <span className="text-[10px] text-gray-400 font-medium">创建人: {note.author || '未知'}</span>
+                           </div>
                            <div className="flex gap-1">
                               <button onClick={() => startEditing(note)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="编辑">
                                  <Edit3 size={14} />
                               </button>
                               <div className="w-px h-4 bg-gray-200 my-auto mx-1"></div>
-                              <button onClick={() => deleteAnnotation(note.id)} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors" title="删除">
+                              <button onClick={() => handleDeleteAnnotation(note.id)} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors" title="删除">
                                  <Trash2 size={14} />
                               </button>
                            </div>
                         </div>
                       </>
                    )}
-                   {/* Arrow */}
                    <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border-t border-l border-gray-100 transform rotate-45"></div>
                 </div>
               )}
             </div>
           ))}
 
-          {/* B. CREATION POPOVER (Pending) */}
+          {/* CREATION POPOVER */}
           {pendingPoint && (
              <div 
                style={{ left: `${pendingPoint.x}%`, top: `${pendingPoint.y}%` }}
@@ -468,7 +582,7 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                          取消
                       </button>
                       <button 
-                         onClick={saveNewAnnotation}
+                         onClick={handleSaveNewAnnotation}
                          disabled={!pendingText.trim()}
                          className="px-4 py-1.5 text-xs bg-violet-600 text-white rounded-md hover:bg-violet-700 disabled:opacity-50 font-medium flex items-center gap-1.5 shadow-sm transition-all hover:shadow"
                       >
@@ -476,7 +590,6 @@ export const MOCK_ANNOTATIONS: Record<string, Annotation[]> = ${JSON.stringify(s
                       </button>
                    </div>
                 </div>
-                {/* Arrow pointing up */}
                 <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-violet-600 transform rotate-45"></div>
              </div>
           )}

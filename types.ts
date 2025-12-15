@@ -1,3 +1,4 @@
+
 export interface DataResource {
   id: string;
   name: string;
@@ -169,4 +170,11 @@ export interface Annotation {
   y: number; // percentage relative to viewport height
   content: string;
   isOpen: boolean; // Is the detail card open?
+  
+  // D1 Database Fields
+  author?: string;
+  created_at?: string;
+  is_resolved?: number; // 0 or 1
+  project_name?: string;
+  page_context?: string;
 }

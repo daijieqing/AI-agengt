@@ -5,6 +5,7 @@
   "assets": {
     "directory": "./dist"
   },
+  "main": "worker.ts",
   "d1_databases": [
     {
       "binding": "DB",

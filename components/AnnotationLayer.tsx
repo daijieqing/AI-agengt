@@ -18,7 +18,8 @@ import {
   Database,
   Wifi,
   WifiOff,
-  Loader2
+  Loader2,
+  AlertTriangle
 } from 'lucide-react';
 import { Annotation } from '../types';
 import { MOCK_ANNOTATIONS } from '../mockData';
@@ -39,6 +40,7 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
   // --- STATE ---
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [status, setStatus] = useState<StorageStatus>('D1_CONNECTING');
+  const [lastError, setLastError] = useState<string>('');
   
   const [isEditMode, setIsEditMode] = useState(false);
   const [isVisible, setIsVisible] = useState(true);
@@ -88,56 +90,64 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
     }
   };
 
+  const fetchMarkers = async () => {
+    let isMounted = true;
+    setStatus('D1_CONNECTING');
+    setLastError('');
+    try {
+      // Construct query params for isolation
+      const params = new URLSearchParams({
+        project_name: PROJECT_NAME,
+        page_context: viewId
+      });
+      
+      const response = await fetch(`${API_BASE_URL}?${params.toString()}`);
+      
+      if (!response.ok) {
+         // Try to parse JSON error first, else text
+         let errMsg = `API Error ${response.status}`;
+         try {
+            const errJson = await response.json();
+            if (errJson.error) errMsg = errJson.error;
+         } catch(e) {
+            errMsg += `: ${await response.text()}`;
+         }
+         throw new Error(errMsg);
+      }
+
+      const data = await response.json();
+      if (isMounted) {
+        const loadedAnnotations: Annotation[] = data.map((row: any) => ({
+           id: String(row.id),
+           x: row.x,
+           y: row.y,
+           content: row.content,
+           author: row.author,
+           created_at: row.created_at,
+           is_resolved: row.is_resolved,
+           project_name: row.project_name,
+           page_context: row.page_context,
+           isOpen: false 
+        }));
+        setAnnotations(loadedAnnotations);
+        setStatus('D1_CONNECTED');
+      }
+    } catch (error: any) {
+      console.warn("D1 Fetch Failed, falling back to LocalStorage:", error);
+      if (isMounted) {
+        // Truncate long error messages (like HTML 500 pages)
+        const msg = error.message.length > 100 ? error.message.substring(0, 100) + '...' : error.message;
+        setLastError(msg);
+        setAnnotations(getLocalData());
+        setStatus('D1_ERROR');
+      }
+    }
+    return () => { isMounted = false; };
+  };
+
   // 1. Fetch Logic
   useEffect(() => {
-    let isMounted = true;
-    
-    const fetchMarkers = async () => {
-      setStatus('D1_CONNECTING');
-      try {
-        // Construct query params for isolation
-        const params = new URLSearchParams({
-          project_name: PROJECT_NAME,
-          page_context: viewId
-        });
-        
-        const response = await fetch(`${API_BASE_URL}?${params.toString()}`);
-        
-        if (!response.ok) {
-           throw new Error('D1 API Error');
-        }
-
-        const data = await response.json();
-        if (isMounted) {
-          // Convert D1 records to frontend Annotation objects
-          // Assuming D1 returns { id, x, y, content, ... }
-          const loadedAnnotations: Annotation[] = data.map((row: any) => ({
-             id: String(row.id), // Ensure string for frontend logic
-             x: row.x,
-             y: row.y,
-             content: row.content,
-             author: row.author,
-             created_at: row.created_at,
-             is_resolved: row.is_resolved,
-             project_name: row.project_name,
-             page_context: row.page_context,
-             isOpen: false // Default closed on load
-          }));
-          setAnnotations(loadedAnnotations);
-          setStatus('D1_CONNECTED');
-        }
-      } catch (error) {
-        console.warn("D1 Fetch Failed, falling back to LocalStorage:", error);
-        if (isMounted) {
-          setAnnotations(getLocalData());
-          setStatus('D1_ERROR');
-        }
-      }
-    };
-
     fetchMarkers();
-
-    return () => { isMounted = false; };
   }, [viewId]);
 
   // 2. Create Logic
@@ -178,16 +188,26 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
                   page_context: newNote.page_context
                })
             });
-            if (!res.ok) throw new Error('Failed to save to D1');
+            if (!res.ok) {
+                let errMsg = `Save Failed ${res.status}`;
+                try {
+                    const errJson = await res.json();
+                    if (errJson.error) errMsg = errJson.error;
+                } catch(e) {
+                    errMsg = await res.text();
+                }
+                throw new Error(errMsg);
+            }
             
             // If D1 returns the new ID, update the optimistic note
             const savedData = await res.json();
             if (savedData && savedData.id) {
                setAnnotations(prev => prev.map(a => a.id === tempId ? { ...a, id: String(savedData.id) } : a));
             }
-         } catch (e) {
+         } catch (e: any) {
             console.error("Save to D1 failed", e);
             setStatus('D1_ERROR');
+            setLastError(e.message || "Save Failed");
             // Fallback save locally
             saveLocalData([...annotations, newNote]);
          }
@@ -206,13 +226,11 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
 
     if (status === 'D1_CONNECTED') {
        try {
-          // Check if it's a temp ID (timestamp) or D1 ID (usually smaller integer number)
-          // If it's a huge number (timestamp), it might not exist in D1 yet if the save failed? 
-          // But for simplicity assume we try to delete.
           await fetch(`${API_BASE_URL}/${id}`, { method: 'DELETE' });
-       } catch (e) {
+       } catch (e: any) {
           console.error("Delete from D1 failed", e);
           setStatus('D1_ERROR');
+          setLastError(e.message);
           setAnnotations(prevAnnotations); // Revert
           saveLocalData(newAnnotations); // Fallback
        }
@@ -238,9 +256,10 @@ export const AnnotationLayer: React.FC<AnnotationLayerProps> = ({ viewId, pageNa
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: editText, is_resolved: target?.is_resolved })
          });
-      } catch (e) {
+      } catch (e: any) {
          console.error("Update D1 failed", e);
          setStatus('D1_ERROR');
+         setLastError(e.message);
          saveLocalData(newAnnotations);
       }
     } else {
@@ -340,6 +359,7 @@ export const ANNOTATIONS = ${JSON.stringify(annotations, null, 2)};`;
         case 'D1_CONNECTING': 
            return <div title="正在连接数据库..." className="flex items-center gap-1 text-blue-600 bg-blue-50 px-2 py-0.5 rounded text-xs font-bold border border-blue-100"><Loader2 size={12} className="animate-spin"/> 连接中</div>;
         case 'D1_ERROR': 
+           return <div title={`连接失败: ${lastError}`} className="flex items-center gap-1 text-red-600 bg-red-50 px-2 py-0.5 rounded text-xs font-bold border border-red-100 max-w-[150px] truncate cursor-help"><AlertTriangle size={12}/> {lastError || 'Error'}</div>;
         case 'LOCAL':
            return <div title="D1 连接失败，使用本地存储" className="flex items-center gap-1 text-orange-600 bg-orange-50 px-2 py-0.5 rounded text-xs font-bold border border-orange-100"><WifiOff size={12}/> Local</div>;
      }
@@ -419,10 +439,10 @@ export const ANNOTATIONS = ${JSON.stringify(annotations, null, 2)};`;
 
          <button
             onClick={handleExport}
-            className="flex items-center justify-center px-3 h-full text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-colors"
-            title="导出数据"
+            className={`flex items-center justify-center px-3 h-full transition-colors ${status === 'D1_ERROR' ? 'text-red-500 bg-red-50' : 'text-slate-500 hover:text-blue-600 hover:bg-blue-50'}`}
+            title="数据与设置"
          >
-            <Code size={16} />
+            {status === 'D1_ERROR' ? <AlertTriangle size={16}/> : <Code size={16} />}
          </button>
 
         <div className="w-px h-6 bg-gray-200"></div>
@@ -438,36 +458,56 @@ export const ANNOTATIONS = ${JSON.stringify(annotations, null, 2)};`;
         </div>
       </div>
 
-      {/* 3. EXPORT MODAL */}
+      {/* 3. EXPORT / SETTINGS MODAL */}
       {showExportModal && (
         <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl flex flex-col max-h-[85vh] animate-in zoom-in-95 duration-200">
             <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
               <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                 <Code size={20} className="text-blue-600"/> 导出标注数据
+                 <Code size={20} className="text-blue-600"/> 数据与设置
               </h3>
               <button onClick={() => setShowExportModal(false)} className="p-1 hover:bg-gray-100 rounded-full transition-colors">
                  <X size={20} className="text-slate-400" />
               </button>
             </div>
-            <div className="p-6 overflow-hidden flex flex-col gap-4 flex-1">
-               <div className="bg-blue-50 text-blue-800 text-sm p-4 rounded-lg border border-blue-100 flex items-start gap-3">
-                  <div className="mt-0.5"><MessageSquarePlus size={16} /></div>
-                  <div>
-                    <div className="font-bold mb-1">D1 数据库同步</div>
-                    当前正在使用 <b>{status === 'D1_CONNECTED' ? 'Cloudflare D1' : '本地存储 (Local Fallback)'}</b>。项目名称: {PROJECT_NAME}, 页面上下文: {viewId}。
+            
+            <div className="p-6 overflow-y-auto flex flex-col gap-6 flex-1">
+               {/* DB STATUS SECTION */}
+               <div className={`text-sm p-4 rounded-lg border flex flex-col gap-3
+                  ${status === 'D1_ERROR' ? 'bg-red-50 border-red-100' : 'bg-blue-50 border-blue-100'}
+               `}>
+                  <div className="flex items-start gap-3">
+                     <div className="mt-0.5">
+                        {status === 'D1_ERROR' ? <AlertTriangle size={16} className="text-red-600"/> : <Database size={16} className="text-blue-600"/>}
+                     </div>
+                     <div className="flex-1">
+                       <div className={`font-bold mb-1 ${status === 'D1_ERROR' ? 'text-red-800' : 'text-blue-800'}`}>
+                          {status === 'D1_CONNECTED' ? 'D1 数据库已连接' : status === 'D1_ERROR' ? '数据库连接错误' : '连接中...'}
+                       </div>
+                       <div className="text-slate-600 break-words">
+                          {status === 'D1_CONNECTED' && <span>当前正在使用 Cloudflare D1。项目: {PROJECT_NAME}</span>}
+                          {status === 'D1_ERROR' && <span className="font-mono text-xs">{lastError}</span>}
+                          {status === 'LOCAL' && <span>当前使用本地存储 (Local Storage)</span>}
+                       </div>
+                     </div>
                   </div>
                </div>
-               <div className="relative flex-1 border border-gray-200 rounded-lg overflow-hidden bg-[#1e1e1e] shadow-inner">
-                  <textarea 
-                     readOnly
-                     className="w-full h-full p-4 bg-transparent text-gray-300 font-mono text-xs outline-none resize-none leading-relaxed"
-                     value={getExportCode()}
-                     spellCheck={false}
-                  />
-                  <div className="absolute top-2 right-2 text-[10px] text-gray-500 font-mono">JSON</div>
+
+               {/* EXPORT DATA SECTION */}
+               <div className="flex-1 flex flex-col">
+                  <div className="text-xs font-bold text-slate-500 mb-2 uppercase">导出数据 (JSON)</div>
+                  <div className="relative flex-1 border border-gray-200 rounded-lg overflow-hidden bg-[#1e1e1e] shadow-inner min-h-[200px]">
+                     <textarea 
+                        readOnly
+                        className="w-full h-full p-4 bg-transparent text-gray-300 font-mono text-xs outline-none resize-none leading-relaxed"
+                        value={getExportCode()}
+                        spellCheck={false}
+                     />
+                     <div className="absolute top-2 right-2 text-[10px] text-gray-500 font-mono">JSON</div>
+                  </div>
                </div>
             </div>
+
             <div className="px-6 py-4 border-t border-gray-100 bg-gray-50 rounded-b-xl flex justify-end gap-3">
                <button onClick={() => setShowExportModal(false)} className="px-4 py-2 text-sm text-slate-600 hover:bg-gray-200 rounded-lg transition-colors">关闭</button>
                <button 

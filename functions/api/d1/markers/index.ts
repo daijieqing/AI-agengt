@@ -9,7 +9,15 @@ export const onRequestGet = async (context: any) => {
   const projectName = url.searchParams.get("project_name");
   const pageContext = url.searchParams.get("page_context");
 
-  // Basic validation to ensure isolation
+  // 1. Validate Binding
+  if (!env.DB) {
+    return new Response(JSON.stringify({ error: "Database binding 'DB' not found in environment." }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  // 2. Validate Query Params
   if (!projectName || !pageContext) {
     return new Response(JSON.stringify({ error: "Missing required query parameters: project_name, page_context" }), {
       status: 400,
@@ -26,7 +34,7 @@ export const onRequestGet = async (context: any) => {
       headers: { "Content-Type": "application/json" }
     });
   } catch (err: any) {
-    return new Response(JSON.stringify({ error: err.message }), {
+    return new Response(JSON.stringify({ error: `D1 Error: ${err.message}` }), {
       status: 500,
       headers: { "Content-Type": "application/json" }
     });
@@ -36,6 +44,13 @@ export const onRequestGet = async (context: any) => {
 export const onRequestPost = async (context: any) => {
   const { request, env } = context;
   
+  if (!env.DB) {
+    return new Response(JSON.stringify({ error: "Database binding 'DB' not found in environment." }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
   try {
     const body = await request.json();
     const { x, y, content, author, created_at, is_resolved, project_name, page_context } = body;
@@ -53,6 +68,7 @@ export const onRequestPost = async (context: any) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
     );
     
+    // Use .first() to get the returned ID
     const result = await stmt.bind(x, y, content, author, created_at, is_resolved, project_name, page_context).first();
 
     return new Response(JSON.stringify(result), {
@@ -60,7 +76,7 @@ export const onRequestPost = async (context: any) => {
       headers: { "Content-Type": "application/json" }
     });
   } catch (err: any) {
-    return new Response(JSON.stringify({ error: err.message }), {
+    return new Response(JSON.stringify({ error: `D1 Error: ${err.message}` }), {
       status: 500,
       headers: { "Content-Type": "application/json" }
     });

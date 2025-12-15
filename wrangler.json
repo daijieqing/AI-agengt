@@ -1,0 +1,11 @@
+{
+  "name": "govtech-smart-manager",
+  "compatibility_date": "2024-09-25",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "yuanxingbiaoji",
+      "database_id": "271c6bf3-5dd9-4153-ae29-fff7288a457a"
+    }
+  ]
+}
